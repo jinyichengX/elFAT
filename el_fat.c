@@ -7,23 +7,27 @@
 * @date         : 2022/9/11    
  * 修改日期        版本号     修改人	      修改内容
  * ----------------------------------------------------
- * 2022/09/11	    V1.0	  jinyicheng	      创建
- * 2023/01/05       V1.1      jinyicheng          添加Unicode字符集编码，GBK<-->Utf-8互解码
+ * 2022/09/11	    V1.0.0	    jinyicheng	        创建，实现文件系统基本结构，目录和文件访问读写等基本功能
+ * 2023/02/17       V1.1.0      jinyicheng          添加文件系统挂载，卸载功能
+ * 2023/03/05       V1.1.1      jinyicheng          添加Unicode字符集编码，GBK<-->Utf-8互解码
+ * 2023/05/28       V1.1.2      jinyicheng          添加文件重定向功能
+ * 2023/08/16       V1.2.3      jinyicheng          自定义内存堆替换malloc
+ * 2024             V1.2        jinyicheng          添加DMA请求
+ * 2024             V1.3        jinyicheng          等OS完成后添加的功能,初步思路是将此文件系统运行在内核态，使用SVC系统调用实现多线程访问
  * ****************************************************************************************/
 
 /*！！！！！重要说明！！！！！*/
 /* 在使用这个库时，请在这个c文件中搜索关键词"重要说明"教你怎么用这个库 */
 /* 因为这个库非常简单，没有什么复杂的功能，所以没有额外的什么说明文件  */
-
+/* 用到的技术点：文件系统结构，链表，位图，二分查找，内存管理，字符编码解码，重定向输出 */
+/* （不涉及复杂算法和结构，技术点简单，大佬嘴下留情 *^_^*） */
 #include "elfat_config.h"
-#include "mheap.h"
-#include "list.h"
+#include "mheap.h"/* 这里替换成el_heap.h */
+#include "el_list.h"
 #include <string.h>
-#if YC_FAT_ENCODE
-#include "ecd.h"
-#endif
+#include <stdbool.h>
 /* 移植报错就关掉这个宏 */
-#define YC_FAT_DEBUG 1
+#define YC_FAT_DEBUG 0
 
 #if YC_FAT_DEBUG
 #include <stdio.h>
@@ -56,12 +60,12 @@ typedef enum
 /* 定义簇链单位大小 */
 #define FAT_SIZE 4
 /* 定义文件最大大小 */
-#define FILE_MAX_SIZE (4*1024*1024*1024-1)
+#define FILE_MAX_SIZE (4ULL * 1024 * 1024 * 1024 - 1)
 #define FATSIZE(S_DISK,S_CLUS) FAT_SIZE*S_DISK/S_CLUS /* FAT1/FAT2 表大小(字节) */
 #endif
 
 /* 定义首目录簇开始扇区 */
-static unsigned int FirstDirSector = 0;/* 此变量可删除？不清楚，在这个文件系统编写早期定义的，已经忘了干什么用的了 */
+//static unsigned int FirstDirSector = 0;/* 此变量可删除？不清楚，在这个文件系统编写早期定义的，已经忘了干什么用的了 */
 
 /* 固定参数begin，不能改 */
 /* 定义FAT32扇区大小，固定为512Byte */
@@ -70,8 +74,6 @@ static unsigned int FirstDirSector = 0;/* 此变量可删除？不清楚，在�
 #define ROOT_CLUS   2
 /* 定义每个FAT文件系统对象最大分区数 */
 #define PER_FATOBJ_PARTITION_NUM 4
-/* 定义文件最大大小 */
-#define FILE_MAX_SIZE (4*1024*1024*1024-1)
 /* 固定参数end，不能改 */
 #if YC_FAT_MKFS
 #define DBR1_SEC_OFF 0
@@ -241,12 +243,18 @@ typedef struct fileHandler
     unsigned int fd;
 	/* 文件首簇 */
     unsigned int FirstClu;
+	
     /* 数据锚定（读） */
-    unsigned int CurClus;   /* 当前簇 */
+    unsigned int CurClus_R;   /* 当前簇 */
+#if !YC_FAT_MULT_SEC_READ
     short CurOffSec;    /* 当前簇内偏移扇区 */
-    unsigned short CurOffByte;  /* 当前扇区内偏移字节 */
+	unsigned short CurOffByte;  /* 当前扇区/簇内偏移字节 */
+#else
+    unsigned short EndCluLeftSize_R; /* 当前簇未读字节数 */
+#endif
     /* 剩余大小（读） */
     unsigned int left_sz;
+	
 	/* 文件大小 */
     unsigned int fl_sz;
     /* 文件状态 */
@@ -256,10 +264,15 @@ typedef struct fileHandler
     int (*Writeback)(struct fileHandler *,void *mem_base,int);/* 文件回写 */
 #endif
     struct list_head WRCluChainList;/* 簇链缓冲头节点，不携带实际数据 */
+    struct list_head RDCluChainList;/* 簇链缓冲头节点，不携带实际数据 */
     /* 文件末簇 */
     unsigned int EndClu;
+	
+	/* 数据锚定（写） */
+	unsigned int CurClus;/* 暂时没用 */
     /* 文件末簇未写大小 */
     unsigned int EndCluLeftSize;
+	
     /* 文件FDI所在扇区及其偏移 */
     struct fdi_info {
         unsigned int fdi_sec;
@@ -404,6 +417,7 @@ union e_cont
 #define MASK_TIME_HOUR 0xF800
 #define MASK_TIME_MIN  0x07E0
 #define MASK_TIME_SEC  0x001F
+#define MAKS_HID_RECYCLE {0xEB,0x90,0xEB,0x90,0x6A}
 /* 创建文件目录项的时间和日期 */
 #define MAKETIME(T) 
 #define MAKEDATE(T)
@@ -467,6 +481,14 @@ union e_cont
                     typeof(y) _y = (y);\
                     _x > _y ? _x : _y;\
                     })/* 任意值比较返回最大 */
+#endif
+#ifndef SWAP_TWO_BYTES
+#define SWAP_TWO_BYTES(ptr1, ptr2) \
+    do { \
+        unsigned char temp = *(ptr1); \
+        *(ptr1) = *(ptr2); \
+        *(ptr2) = temp; \
+    } while (0)
 #endif
 #define CLR_BIT(a,n) (a = a&(~(1<<n)))/* a的第n位清0 */
 #define SET_BIT(a,n) (a = a|(1<<n))/* a的第n位置1 */
@@ -632,26 +654,32 @@ static void YC_ConstMem_l(unsigned char *_tar, const unsigned char *_src, unsign
 #if 1
 static void *YC_Memset(void *dest, int set, unsigned len)
 {
-	if((NULL == dest) || (0 == len))
-		return NULL;
-	char *pdest = (char *)dest;
-	while (len-->0)
-	{
-		*pdest++ = set;
-	}
-	return dest;
+    if ((NULL == dest) || (0 == len))
+        return NULL;
+    char *pdest = (char *)dest;
+    uint32_t set_word = (uint32_t)((set & 0xFF) | (set << 8) | (set << 16) | (set << 24));
+    while (len >= 4){
+        *((uint32_t *)pdest) = set_word;
+        pdest += 4;
+        len -= 4;
+    }
+    while (len-- > 0) *pdest++ = (char)set;
+    return dest;
 }
 #endif
-//#define YC_Memset memset
-/* 内存复制 */
+
+/* 内存复制，总线利用率较高 */
 static void YC_MemCpy(unsigned char *_tar, unsigned char *_src, unsigned len) {
     if ((NULL == _tar) || (NULL == _src) || (0 == len)) return;
-    do {
-        *_tar++ = *_src;
-        _src++;
-        len = len - 1;
-    } while (len);
+    int temp = len/sizeof(unsigned int);
+    for(int i=0; i<temp; i++)
+    {
+        ((unsigned int *)_tar)[i] = ((unsigned int *)_src)[i];
+    }
+    i *= sizeof(unsigned int);
+    for(;i<len;i++) _tar[i] = _src[i];
 }
+
 /* 解析字符串长度 */
 static unsigned int YC_StrLen(unsigned char *str)
 {
@@ -935,8 +963,14 @@ static void YC_FAT_AnalyseFDI(FDI_t *fdi,FILE1 *fileInfo)
     unsigned int f_s = Byte2Value((unsigned char *)&fdi->fileSize,4);
 
     /* 将读出的文件信息保存 */
-    flp->CurClus = fl_clus;
-    flp->CurOffSec = flp->CurOffByte = 0;
+    flp->CurClus_R = fl_clus;
+#if !YC_FAT_MULT_SEC_READ
+    flp->CurOffSec = 0;
+	flp->CurOffByte = 0;
+#else
+	flp->EndCluLeftSize_R = 0;
+#endif
+	
     flp->fl_sz = flp->left_sz = f_s ;
     flp->FirstClu = fl_clus;
 }
@@ -978,8 +1012,6 @@ static SeekFile YC_FAT_ReadFileAttribute(FILE1 * file,unsigned char *filename)
         fileDirSec = g_dbr[0].rsvdSecCnt + (g_dbr[0].numFATs * g_dbr[0].FATSz32);
     else
         fileDirSec = g_mbr.dpt[0].partStartSec + g_dbr[0].rsvdSecCnt + (g_dbr[0].numFATs * g_dbr[0].FATSz32);
-
-    FirstDirSector = fileDirSec;
     
     unsigned int fdi_clu = ROOT_CLUS;
 
@@ -1154,44 +1186,44 @@ static int TakeFileClusList_Eftv(unsigned int first_clu)
     return bk1;
 }
 
-/* 跨扇区？ */
+/* 跨扇区，这个宏应该没什么用 */
 #define READ_EOS(f) (0 == (f->fl_sz-f->left_sz)%PER_SECSIZE)
-//#define READ_EOC(f) (0 == (f->fl_sz-f->left_sz)%PER_SECSIZE)
 
-static unsigned char app_buf[PER_SECSIZE];
-static unsigned int bk = 0;
-/* 待测 */
+/* 构建读簇链 */
+static int YC_FAT_CreatReadCluChain(FILE1* fileInfo,unsigned int len,unsigned int off)
+{
+
+}
+
 /* 数据读取函数，不考虑参数len长度可能导致的数据越界 */
 static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int len,unsigned char * buffer)
 {
-    if(FILE_OPEN != fileInfo->file_state)
-        return 0;
+    if(FILE_OPEN != fileInfo->file_state) return 0;
+    if(!fileInfo->fl_sz) return 0;
     FILE1 * f_r;
     unsigned int l_ilegal = 0;  /* 已读的有效数据长度 */
     char i;
-    unsigned int n_clu = fileInfo->CurClus; /* 初始簇 */
     unsigned int t_rSize = MIN(len, fileInfo->left_sz);/* 需要读的数据大小 */
-	unsigned int t_rb = t_rSize;/* 备份 */
-    unsigned int t_rSec = 0, t_rClu = 0;
-    unsigned int Secleft = 0;
-	
+    unsigned int t_rSec;
     if(!t_rSize) return 0;
-	/* 需要读的扇区个数 */
+
+#if YC_FAT_MULT_SEC_READ
+    t_rSec = fileInfo->EndCluLeftSize_R;
+    YC_FAT_CreatReadCluChain(fileInfo,len,0);
+    /* 先将本扇区内数据读出来 */
+    /* 再读剩余扇区 */
+#else
+    /* 单扇区读 */
+    static unsigned char app_buf[PER_SECSIZE];static unsigned int bk = 0;
+    unsigned int Secleft = 0,t_rb = t_rSize;/* 备份 */
+    unsigned int n_clu = fileInfo->CurClus_R; /* 初始簇 */
+    /* 计算需要读的扇区个数 */
 	t_rSec = ( ( PER_SECSIZE*((fileInfo->fl_sz - fileInfo->left_sz + t_rSize)/PER_SECSIZE) )\
         - ( PER_SECSIZE*((fileInfo->fl_sz - fileInfo->left_sz)/PER_SECSIZE) ) )/PER_SECSIZE;
     if((fileInfo->fl_sz - fileInfo->left_sz + t_rSize)%PER_SECSIZE)
     {
 		t_rSec += 1;
     }
-    /* 需要读的簇个数 */
-	t_rClu = ( ( PER_SECSIZE*g_dbr[0].secPerClus*((fileInfo->fl_sz - fileInfo->left_sz + t_rSize)/(PER_SECSIZE*g_dbr[0].secPerClus)) )\
-        - ( PER_SECSIZE*g_dbr[0].secPerClus*((fileInfo->fl_sz - fileInfo->left_sz)/(PER_SECSIZE*g_dbr[0].secPerClus)) ) )/(PER_SECSIZE*g_dbr[0].secPerClus);
-    if((fileInfo->fl_sz - fileInfo->left_sz + t_rSize)%(PER_SECSIZE*g_dbr[0].secPerClus))
-    {
-		t_rClu += 1;
-    }
-    //t_rClu --;
-#if 1    /* 扇区读 */
     /* 找出当前簇内的首扇区（扇区偏移） */
     if(t_rSec)
         Secleft =  g_dbr[0].secPerClus - fileInfo->CurOffSec;
@@ -1205,7 +1237,7 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int len,unsigned cha
             {
                 /* 取当前扇区数据 */
 				usr_read(app_buf,START_SECTOR_OF_FILE(n_clu)+fileInfo->CurOffSec , 1);
-                //memcpy((unsigned char *)buffer+l_ilegal,app_buf+fileInfo->CurOffByte,MIN(PER_SECSIZE-fileInfo->CurOffByte,t_rSize));
+                memcpy((unsigned char *)buffer+l_ilegal,app_buf+fileInfo->CurOffByte,MIN(PER_SECSIZE-fileInfo->CurOffByte,t_rSize));
 				YC_Memset(buffer,0,PER_SECSIZE);
 				YC_StrCpy_l(buffer,app_buf+fileInfo->CurOffByte,MIN(PER_SECSIZE-fileInfo->CurOffByte,t_rSize));
 				
@@ -1239,7 +1271,7 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int len,unsigned cha
             t_rSec = t_rSec - Secleft;
             if(t_rSec){//剩下的需要读的总扇区大于0
                 n_clu = YC_TakefileNextClu(n_clu);
-                fileInfo->CurClus = n_clu;
+                fileInfo->CurClus_R = n_clu;
                 Secleft = (t_rSec >= g_dbr[0].secPerClus)?(g_dbr[0].secPerClus):(t_rSec);
             }else{
                 break;
@@ -1254,15 +1286,11 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int len,unsigned cha
     }while(!IS_EOF(n_clu));
     /* 可读扇区=0 进行边界处理 */
     if(READ_EOS(fileInfo) && (fileInfo->left_sz == 0)){
-        fileInfo->CurClus = fileInfo->FirstClu;
+        fileInfo->CurClus_R = fileInfo->FirstClu;
         fileInfo->CurOffSec = 0;
-    }else if(1){
-        ;
     }
-#else    /* 簇读 */
-	
 #endif
-	fileInfo->left_sz -= t_rb;
+	fileInfo->left_sz -= t_rSize;
 }
 
 /* 小写转大写 */
@@ -1563,7 +1591,8 @@ FILE1 * YC_FAT_OpenFile(FILE1 * f_op, unsigned char * filepath)
 			if(file->EndCluLeftSize == PER_SECSIZE*g_dbr[0].secPerClus)/* 临界处理 */
 				file->EndCluLeftSize = 0;
         }
-		
+		file->EndCluLeftSize_R = g_dbr[0].secPerClus*PER_SECSIZE;
+		INIT_LIST_HEAD(&file->RDCluChainList);
 		INIT_LIST_HEAD(&file->WRCluChainList);
         file->file_state = FILE_OPEN; open_sem--;update_matchInfo(f_op,1,1);
         return file;
@@ -1590,7 +1619,13 @@ int YC_FAT_Close(FILE1 * f_cl)
     if(NULL == f_cl) return CLOSE_HOLE_FILE_ERR;
 	update_matchInfo(f_cl,2,1);
 	open_sem ++;
-    f_cl->CurClus = f_cl->CurOffByte = f_cl->CurOffSec = 0;
+    f_cl->CurClus_R = 0;
+#if !YC_FAT_MULT_SEC_READ
+	f_cl->CurOffSec = 0;
+	f_cl->CurOffByte = 0;
+#else
+	f_cl->EndCluLeftSize_R = 0;
+#endif
     f_cl->file_state = FILE_CLOSE;
     f_cl->FirstClu = 0;
     f_cl->fl_sz = 0;
@@ -2002,10 +2037,10 @@ static int YC_FAT_SeekNextFirstEmptyClu(unsigned int current_clu,unsigned int * 
 /* ycfat初始化 */
 int YC_FAT_Init(struct FilesystemOperations * fatobj)
 {
-    if(NULL == fatobj) return -1;
+    //if(NULL == fatobj) return -1;
     /* 大小端检测 */
     endian_checker();
-
+	//unsigned char hid_rec[5] = MAKS_HID_RECYCLE;char i;
     /* 解析绝对0扇区 */
     YC_FAT_AnalyseSec0();
 #if YC_FAT_DEBUG
@@ -2025,7 +2060,7 @@ int YC_FAT_Init(struct FilesystemOperations * fatobj)
 
     /* 读取FSINFO扇区，更新剩余空簇 */
     YC_FAT_ReadInfoSec((unsigned int *)&FatInitArgs_a[0].FreeClusNum);
-
+		
     return 0;
 }
 
@@ -2404,7 +2439,6 @@ static int SeekNextFreeClu_BitMap(unsigned int clu)
 }
 
 /* 将空簇添加至文件写缓冲簇链中 */
-/* 2022.11.22测试通过 */
 static int YC_FAT_AddToList(FILE1 *fl,unsigned int clu)
 {
     if(NULL == fl) return -1;
@@ -2572,12 +2606,13 @@ static void YC_FAT_SewCluChain(FILE1 *fl)
     }
 	
 	temp = fl->EndClu;
-	usr_read(buffer1,CLU_TO_FATSEC(temp),1);/* 将本节点头簇FAT所在扇区读出来 */
+    if(list_empty(&fl->WRCluChainList))
+	    usr_read(buffer1,CLU_TO_FATSEC(temp),1);/* 将本节点头簇FAT所在扇区读出来 */
     /* 遍历所有的簇链节点 */
     list_for_each_safe(pos, next, &fl->WRCluChainList)
     {
-		temp1 = ((w_buffer_t *)pos)->w_s_clu;//游走变量
-		temp2 = ((w_buffer_t *)pos)->w_e_clu;//固定变量
+		temp1 = ((w_buffer_t *)pos)->w_s_clu;
+		temp2 = ((w_buffer_t *)pos)->w_e_clu;
 		for(;;)
 		{	
 			t_clu = temp-TAKE_FAT_OFF(temp)+(PER_SECSIZE/FAT_SIZE)-1;
@@ -2606,7 +2641,7 @@ static void YC_FAT_SewCluChain(FILE1 *fl)
 /* 写文件，只支持在文件末尾追加数据 */
 //对于多文件并发写入时，采用一些策略（如锁机制，信号量机制等）来优化簇的分配，确保并发写入的正确性，裸机程序不需要考虑这类情况
 //除了写文件外，调用其他任何与线程安全相关的代码必须使用锁机制，裸机程序不需要考虑这类情况
-/* 此函数不是最简单的编写方法，涉及大量的边界处理比较复杂，设计思想却比较简单，建议不必深入研读源码，有能力的可以重写此函数 */
+/* 此函数不是最简单的编写方法，涉及大量的边界处理比较复杂，执行效率较低，设计思想却比较简单，建议不必深入研读源码，有能力的可以重写此函数或独创一种写机制 */
 static int YC_WriteDataCheck(FILE1* fileInfo,unsigned char * d_buf,unsigned int len)
 {
     if(NULL == fileInfo)
@@ -2627,7 +2662,7 @@ static int YC_WriteDataCheck(FILE1* fileInfo,unsigned char * d_buf,unsigned int 
     }
     /* 记录剩余大小 */
     unsigned int wr_size = len;unsigned int bkl = len;
-	unsigned int to_alloc_num = 0;
+	int to_alloc_num = 0;
 	
     /* 计算需要的空闲簇数 */
     if(fileInfo->fl_sz == 0)/* 新文件 */
@@ -2764,7 +2799,8 @@ static int YC_WriteDataCheck(FILE1* fileInfo,unsigned char * d_buf,unsigned int 
         else/* 旧文件需要分配簇链 */
         {
             /* 起始参数 */
-			off_sec = (PER_SECSIZE*g_dbr[0].secPerClus - fileInfo->EndCluLeftSize)/PER_SECSIZE;
+			if(!fileInfo->EndCluLeftSize) off_sec = 0;
+			else off_sec = (PER_SECSIZE*g_dbr[0].secPerClus - fileInfo->EndCluLeftSize)/PER_SECSIZE;
 			off_byte = (PER_SECSIZE*g_dbr[0].secPerClus - fileInfo->EndCluLeftSize)%PER_SECSIZE;
             /* 先补一扇区 */
             i = START_SECTOR_OF_FILE(fileInfo->EndClu);
@@ -2843,13 +2879,18 @@ static int YC_WriteDataCheck(FILE1* fileInfo,unsigned char * d_buf,unsigned int 
     return 0;
 }
 
+unsigned int YC_FAT_TakeFileSize(FILE1 * fl)
+{
+    return fl->fl_sz;
+}
+
 int YC_FAT_flseek0(FILE1* fileInfo)
 {
     if(fileInfo->file_state == FILE_OPEN)
     {
-        fileInfo->CurClus = 1;
-        fileInfo->CurOffByte = 0;
-        fileInfo->CurOffSec = 0;
+        fileInfo->CurClus_R = 1;
+//        fileInfo->CurOffByte = 0;
+        //fileInfo->CurOffSec = 0;
         return 0;
     }
     return 1;
@@ -3180,7 +3221,9 @@ int YC_FAT_Mount(unsigned char *drvn,ioopr_t *usrdev,char if_mkfs)
 	fatobj->fileOpr_Rename = YC_FAT_RenameFile;
 	fatobj->fileOpr_Write = YC_FAT_Write;
 	fatobj->fsOpr_Init = YC_FAT_Init;
+#if YC_FAT_CROP
 	fatobj->fileOpr_Crop = YC_FAT_FileCrop;
+#endif
 #if YC_FAT_MKFS
 	fatobj->diskOpr_Format = YC_FAT_MakeFS;
 #endif
@@ -3195,8 +3238,10 @@ int YC_FAT_Mount(unsigned char *drvn,ioopr_t *usrdev,char if_mkfs)
 	fatobj->ioopr.DeviceOpr_CLR = usrdev->DeviceOpr_CLR;
     /* 大小端检测 */
     endian_checker();
+#if YC_FAT_MKFS
 	if(if_mkfs)
         fatobj->diskOpr_Format(114514,114514);
+#endif
 	/* 初始化文件系统 */
 	if(0 == fatobj->fsOpr_Init(fatobj)) fatobj->hay = MOUNT_SUCCESS;/* 标记成功挂载 */
 	else fatobj->hay = FAULTY_DISK;/* 标记坏盘 */
@@ -3216,85 +3261,84 @@ int YC_FAT_Unmount(unsigned char *drvn)
 	return 0;
 }
 #if YC_FAT_ENCODE
+
+// 定义一个枚举
+enum CharacterEncoding  {
+    ASCII,
+    UTF_8,
+    GBK
+};
 /* 以下是关于字符编码的一些处理 */
-enum UNI_ENCODING_SET 
+typedef enum CHARA_ENCODING_SET 
 {
     E_UTF8 = 0,
-    E_UTF16LE,
-    E_UTF16BE,
-    E_UTF32LE,
-    E_UTF32BE,
-};
-enum ANSI_GBK_SET
-{
-    E_GB2312 = 0,
+    E_GB2312,
     E_GBK,
-    E_GB18030,
-};
-typedef struct Character_sets
-{
-    enum UNI_ENCODING_SET uni_ecd;
-    enum ANSI_GBK_SET oem_ecd;
 }Char_sets_t;
 
 /* 用来匹配Unicode字符，一般中文字符的Utf8编码为3字节 */
 /* 定义了一个UTF-8到GBK的映射表 */
-//typedef J_UINT8 (*BufToUint8_t)(J_UINT8 *);
-//typedef J_UINT16 (*BufToUint16_t)(J_UINT8 *);
-typedef J_UINT32 (*BufToUint32_t)(J_UINT8 *);
-//J_UINT32 BEBufToUint32(J_UINT8 *_pBuf)
-//{
-//    return (((J_UINT32)_pBuf[0] << 24) | ((J_UINT32)_pBuf[1] << 16) | ((J_UINT32)_pBuf[2] << 8) | _pBuf[3]);
-//}
+typedef J_UINT32 (*BufToUint_t)(J_UINT8 *);
+J_UINT32 BEBufToUint32(J_UINT8 *_pBuf)
+{
+    return (((J_UINT32)_pBuf[0] << 24) | ((J_UINT32)_pBuf[1] << 16) | ((J_UINT32)_pBuf[2] << 8) | _pBuf[3]);
+}
 J_UINT32 BEBufToUint24(J_UINT8 *_pBuf)
 {
     return  ((J_UINT32)_pBuf[0] << 16) | ((J_UINT32)_pBuf[1] << 8) | _pBuf[2];
 }
-//J_UINT16 BEBufToUint16(J_UINT8 *_pBuf)
-//{
-//    return (((J_UINT16)_pBuf[0] << 8) | _pBuf[1]);
-//}
-//J_UINT8 BEBufToUint8(J_UINT8 *_pBuf)
-//{
-//    return _pBuf[0];
-//}
+J_UINT32 BEBufToUint16(J_UINT8 *_pBuf)
+{
+    return (((J_UINT16)_pBuf[0] << 8) | _pBuf[1]);
+}
+J_UINT32 BEBufToUint8(J_UINT8 *_pBuf)
+{
+    return _pBuf[0];
+}
+
+static BufToUint_t b2val_table[] = { NULL,\
+    BEBufToUint8,\
+    BEBufToUint16,\
+    BEBufToUint24,\
+    BEBufToUint32,\
+    NULL,\
+    NULL\
+};
+
 /* 二分查表 */
-/* table表起始地址 */
-/* unit_total_num单元数量即表共多少行 */
-/* per_unit_size每单元大小表每一行字节数*/
-/* per_unit_off从每单元偏移多少开始查*/
-/* data_size被查单元大小，就是一次查几个字节*/
+/* table：表起始地址 */
+/* unit_total_num：单元数量即表共多少行 */
+/* per_unit_size：每单元大小表每一行字节数*/
+/* per_unit_off：从每单元偏移多少开始查*/
+/* data_size：被查单元大小，就是一次查几个字节*/
+/* mode：查询的表是大端还是小端 */
 int MappingTableSearch(unsigned int NumToSearch,const unsigned char *table,unsigned int unit_total_num,\
 unsigned char per_unit_size,unsigned char per_unit_off,unsigned char data_size)
 {
-    if(per_unit_off + data_size > per_unit_size) return -1;/* 参数错了，引起混叠了(*^_^*) */
-    int b1 = 0,b2 = unit_total_num-1;
-    int index;int k = 0;
+    if(per_unit_off + data_size > per_unit_size) return -1;/* 混叠错误 */
     if( (data_size < 1) || (data_size > 4) )
         return -2;
-    BufToUint32_t BufToUint = BEBufToUint24;/* 先默认需要查询的数据是大端24字节的数据 */
+
+    int b1 = 0,b2 = unit_total_num-1;/* 最小和最大索引 */
+    int index;int k = 0;/* 当前索引和索引次数 */
+    unsigned int offb,index_val;/* 偏移字节和索引值 */
     while(b1<=b2){
-        /* 最多查32次强制退出，因为到第33次已经排除了40多亿数据了 */
+        /* 最多查32次强制退出，因为到第33次已经排除40多亿数据了 */
         if(k > 32) return -3;
         k++;
         index = b1+(b2-b1)/2;
 #if YC_FAT_DEBUG
         printf("当前索引是 %d(以每单元大小为单位)\r\n",index);
 #endif
-        if(k == 1){
-            if(BufToUint(   table+index*per_unit_size+per_unit_off   ) != NumToSearch){
-                if( BufToUint(  table+index*per_unit_size+per_unit_off  ) < NumToSearch ) b1 = index+1;
-                else if(BufToUint(  table+index*per_unit_size+per_unit_off  ) > NumToSearch ) b2 = index-1;
-            }
-        }else if(k != 1){
-            if(BufToUint(   table+index*per_unit_size+per_unit_off   ) != NumToSearch){
-                if( BufToUint(  table+index*per_unit_size+per_unit_off  ) < NumToSearch ) b1 = index+1;
-                else if(BufToUint(  table+index*per_unit_size+per_unit_off  ) > NumToSearch ) b2 = index-1;
-            }
-        }
-        if(BufToUint(  table+index*per_unit_size+per_unit_off    ) == NumToSearch){
+        offb = index*per_unit_size+per_unit_off;
+        index_val = b2val_table[data_size]( (unsigned char *)table + offb );/* 计算索引值 */
+        if( index_val < NumToSearch ) 
+            b1 = index+1;
+        else if( index_val > NumToSearch ) 
+            b2 = index-1;
+        if(index_val == NumToSearch){
 #if YC_FAT_DEBUG
-            printf("第%d个字节是需要查找的值, 共%d个字节 ",index*per_unit_size+per_unit_off,data_size);
+            printf("第%d个字节是需要查找的值, 共%d个字节 ",offb,data_size);
             printf("最终索引值是 %d\r\n",NumToSearch);
 #endif
             return index;
@@ -3310,7 +3354,7 @@ bool YC_FAT_IsTextAscii(unsigned char *pbuf)
 
 /* 检查文本是不是utf8或gbk编码，如果是其他编码可能会出错 */
 /* 此功能有很大的漏洞 */
-bool IsTextUTF8(const unsigned char *str, int strlength)
+bool IsTextUTF8_Uncarefully(const unsigned char *str, int strlength)
 {
 #ifndef OS_WINDOWS
     typedef unsigned int DWORD;
@@ -3341,12 +3385,10 @@ bool IsTextUTF8(const unsigned char *str, int strlength)
     }
     if(k-j)
     {
+        /* 保证至少有6个字节的数据参与检测 */
         if((k-j)%6 == 0)
         {
-            if ( ((*(str + j) & 0xE0) == 0xE0) && ((*(str + j + 3 ) & 0xE0) == 0xE0) && ((*(str + j + 1 ) & 0x80) == 0x80)\
-                && ((*(str + j + 2 ) & 0x80) == 0x80) && ((*(str + j + 4 ) & 0x80) == 0x80) && ((*(str + j + 5 ) & 0x80) == 0x80)){
-                    ;
-            }
+            if ( ((*(str + j) & 0xE0) == 0xE0) && ((*(str + j + 3 ) & 0xE0) == 0xE0) );
             else{
                 isUTF8 = false;/* GBK */
             }
@@ -3358,9 +3400,8 @@ bool IsTextUTF8(const unsigned char *str, int strlength)
     return isUTF8;
 }
 
-#if YC_FAT_ENCODE
-#define U2G_TBUNIN sizeof(utf8togbk_table)/5
-#endif
+#define U2G_TBUNIN (sizeof(utf8togbk_table)/5)
+//#define G2U_TBUNIN (sizeof(gbk2utf8_table)/5)
 /* 一个UTF8编码的Unicode字符转GBK字符 */
 /* 返回编码后的GBK字符长度 */
 char YC_FAT_utf8_to_gbk(unsigned char *p_uni,unsigned short *p_gbk)
@@ -3372,7 +3413,7 @@ char YC_FAT_utf8_to_gbk(unsigned char *p_uni,unsigned short *p_gbk)
     }
     else
     {
-        /* 如果不是ASCII码就默认是3字节长度的GBK汉字或符号 */
+        /* 如果不是ASCII码就默认是2字节长度的GBK汉字或符号 */
         unsigned int uni_val = BEBufToUint24(p_uni);/* 转成大端格式 */
         int index;
         if(0 > (index = MappingTableSearch(uni_val,utf8togbk_table,U2G_TBUNIN,5,0,3)))
@@ -3386,6 +3427,34 @@ char YC_FAT_utf8_to_gbk(unsigned char *p_uni,unsigned short *p_gbk)
             *((unsigned char *)p_gbk+1) = *(utf8togbk_table+index*5+4);
             return 2;
         }
+    }
+}
+/* 一个gbk字符转UTF8编码的Unicode字符 */
+/* 返回编码后的unicode字符长度 */
+char YC_FAT_gbk_to_utf8(unsigned char *s_gbk,unsigned int *t_uni)
+{
+    *t_uni = 0;
+    if(YC_FAT_IsTextAscii(s_gbk)) {
+        *(unsigned char *)t_uni = *s_gbk;
+        return 1;
+    }
+    else
+    {
+//        unsigned int gbk_val = BEBufToUint16(s_gbk);/* 转成大端格式 */
+//        /* 在gbk--->utf8表中查找对应的utf8编码 */
+//        int index;
+//        if(0 > (index = MappingTableSearch(gbk_val,gbk2utf8_table,G2U_TBUNIN,5,0,2)))
+//        {
+//            /* 没查到 */
+//            return 0;
+//        }
+//        else
+//        {
+//            *(unsigned char *)t_uni = *(gbk2utf8_table+index*5+2);
+//            *((unsigned char *)t_uni+1) = *(gbk2utf8_table+index*5+3);
+//            *((unsigned char *)t_uni+2) = *(gbk2utf8_table+index*5+4);
+//            return 3;
+//        }
     }
 }
 
@@ -3469,4 +3538,88 @@ char YC_FAT_Uni2Utf8(unsigned int Uni,void *pUtf8)
         return 4;
     }else return 0;
 }
+
+/* 用户中间变量转ascii,返回ascii长度 */
+char YC_FAT_int_to_str(int _iNumber, char *_pBuf)
+{
+    char i = 0,j = 0,k;
+    int bk = _iNumber;
+    /* 用于位匹配的字符串 */
+    char *matchtable = "0123456789";
+    if(!_iNumber) {
+        _pBuf[0] = matchtable[0];
+        return 1;
+    }
+    if(_iNumber < 0){
+         _pBuf[i] = '-'; i++;
+         _iNumber = -_iNumber;
+    }
+    for(;_iNumber;i++,_iNumber /= 10)
+    {
+        j = _iNumber%10;
+        _pBuf[i] = matchtable[j];
+    }
+    if(bk<0) {j = (i-1)/2;for(k = 0;k<j;k++) SWAP_TWO_BYTES(_pBuf+k+1,_pBuf+i-1-k);}
+    else {j = i/2;for(k=0;k<j;k++) SWAP_TWO_BYTES(_pBuf+k,_pBuf+i-1-k);}
+    return i;
+}
+
+/* 向文件追加字符串,指定编码方式，这个过程执行效率较低,平均每个字符写入耗时约1ms */
+int YC_FAT_puts(FILE1 *file,const unsigned char * str,Char_sets_t Encode_mode)
+{
+    int str_len = YC_StrLen((unsigned char *)str);
+    int index = str_len;char once_len = 0;
+    unsigned char * to_ecd;
+    bool utf8 = IsTextUTF8_Uncarefully(str,str_len);
+    if(utf8){
+        /* 如果是utf8编码 */
+        if(E_UTF8 == Encode_mode){
+            YC_FAT_Write(file,(unsigned char *)str,str_len);/* 直接写入 */
+        }else{
+            unsigned short e_gbk;index = 0;
+            /* UTF8--->GBK */
+            while(str_len - index)
+            {
+                if(0 == (once_len = YC_FAT_utf8_to_gbk((unsigned char *)(str+index),&e_gbk)))
+                    break;
+                index = index + ((2 == once_len)?3:1);
+                YC_FAT_Write(file,(unsigned char *)&e_gbk,once_len);
+            }
+        }
+    }else{
+        /* 文本是GBK编码 */
+        if((E_GB2312 == Encode_mode) || (E_GBK == Encode_mode)){
+            YC_FAT_Write(file,(unsigned char *)str,str_len);/* 直接写入 */
+        }else{
+            unsigned int e_unic;index = 0;
+            /* GBK--->UTF8 */
+//            while(str_len - index)
+//            {
+//                if(0 == (once_len = YC_FAT_gbk_to_utf8((unsigned char *)(str+index),&e_unic)))
+//                    break;
+//                index = index + ((3 == once_len)?2:1);
+//                YC_FAT_Write(file,(unsigned char *)&e_unic,once_len);
+//            }
+        }
+    }
+	return (str_len-index);/* 返回未写入的大小，如果返回0就表示全写入成功了 */
+}
+//	YC_FAT_Init();
+//	YC_FAT_CreateFile((unsigned char *)"./5.TXT");
+//	YC_FAT_OpenFile(&file1,(unsigned char *)"./5.TXT");
+//	YC_FAT_CreateFile((unsigned char *)"./6.TXT");
+//	YC_FAT_OpenFile(&file2,(unsigned char *)"./6.TXT");
+//	printf("writing character set... now\r\n");
+////	for(int i = 0;i<5000;i++){
+////		if(i%100 == 0)
+////			printf("i = %d\r\n",i);
+////		YC_FAT_Write(&file1,d_buff,sizeof(d_buff));
+////	}
+//	if (0<YC_FAT_puts(&file1,"我是神里绫华的狗",E_UTF8))
+//		printf("file1 write err\r\n");
+//	if (YC_FAT_puts(&file2,"我是神里绫华的狗",E_GBK))
+//		printf("file2 write err\r\n");
+//	printf("writing ok\r\n");
+//	YC_FAT_Close(&file1);
+//	YC_FAT_Close(&file2);
 #endif
