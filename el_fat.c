@@ -1267,11 +1267,11 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
             else
             {
                 usr_read(buffer0,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec,1);
-                YC_MemCpy(buffer,buffer0,powder_len);
-                r_off += powder_len;
+                YC_MemCpy(buffer,buffer0+(PER_SECSIZE - powder_len),powder_len);
+                r_off += powder_len;off_sec += 1;
                 int_secNum = once_secNum = (t_rSize-powder_len)/PER_SECSIZE;
                 if((t_rSize-powder_len)%PER_SECSIZE) once_secNum++;
-                usr_read(buffer0+r_off,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec,int_secNum);
+                usr_read(buffer0+r_off,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec+1,int_secNum);
                 if(int_secNum != once_secNum){
                     r_off += int_secNum*PER_SECSIZE;
                     usr_read(buffer0,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec+int_secNum,1);
@@ -1311,6 +1311,7 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
             usr_read(buffer0,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec,1);
             YC_MemCpy(buffer,buffer0+PER_SECSIZE-powder_len,powder_len);
             r_off += powder_len;
+			off_sec ++;
         }
         usr_read(buffer+r_off,START_SECTOR_OF_FILE(fileInfo->CurClus_R)+off_sec,int_secNum);
         r_off += cur_leftsize;
