@@ -281,12 +281,21 @@ typedef struct fileHandler
     }fdi_info_t;
 }FILE1;
 
-typedef struct WRCluChainBuffer
+typedef struct RWCluChainBuffer
 {
-    struct list_head WRCluChainNode;
-    unsigned int w_s_clu;    /* 头簇 */
-    unsigned int w_e_clu;    /* 尾簇 */
-}w_buffer_t; 
+	union {
+		struct list_head WRCluChainNode;
+		struct list_head RDCluChainNode;
+	};
+	union{
+		unsigned int w_s_clu;    /* 头簇 */
+		unsigned int r_s_clu;    /* 头簇 */
+	};
+	union{
+		unsigned int w_e_clu;    /* 尾簇 */
+		unsigned int r_e_clu;    /* 尾簇 */
+	};
+}w_buffer_t,r_buffer_t; 
 
 typedef struct FAT_Table
 {
@@ -1214,14 +1223,14 @@ static int YC_FAT_CreatReadCluChain(FILE1* fileInfo,unsigned int CluNum)
 {
     struct list_head *pos, *tmp;
     unsigned int last_clu = fileInfo->CurClus_R;
-    w_buffer_t * r_ccb = (w_buffer_t *)0;
+    r_buffer_t * r_ccb = (w_buffer_t *)0;
     if(fileInfo == NULL) return -1;
     do{
         last_clu = YC_TakefileNextClu( last_clu );
         if(last_clu == 0x0fffffff) return -2;/* 改为断言 */
-        if((last_clu != (r_ccb->w_e_clu + 1)) || (r_ccb == (w_buffer_t *)0))
+        if((last_clu != (r_ccb->r_e_clu + 1)) || (r_ccb == (r_buffer_t *)0))
         {
-            r_ccb = (w_buffer_t *)tAllocHeapforeach(sizeof(w_buffer_t));
+            r_ccb = (r_buffer_t *)tAllocHeapforeach(sizeof(r_buffer_t));
             if(NULL == r_ccb)
             {
                 /* 错误处理，删除并释放所有链表节点 */
@@ -1230,10 +1239,10 @@ static int YC_FAT_CreatReadCluChain(FILE1* fileInfo,unsigned int CluNum)
             }
             /* add to clu chain */
             list_add_tail(&r_ccb->WRCluChainNode,&fileInfo->RDCluChainList);
-            r_ccb->w_s_clu = r_ccb->w_e_clu = last_clu;
+            r_ccb->r_s_clu = r_ccb->r_e_clu = last_clu;
             continue;
         }
-        r_ccb->w_e_clu = last_clu;
+        r_ccb->r_e_clu = last_clu;
     }while( -- CluNum );
     return 0;
 }
@@ -1322,9 +1331,9 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
     {
         if(list_is_last(pos,&fileInfo->RDCluChainList))
         {
-            chain_low = ((w_buffer_t *)pos)->w_s_clu;
-            chain_high = ((w_buffer_t *)pos)->w_e_clu;
-            fileInfo->CurClus_R = ((w_buffer_t *)pos)->w_e_clu;
+            chain_low = ((r_buffer_t *)pos)->r_s_clu;
+            chain_high = ((r_buffer_t *)pos)->r_e_clu;
+            fileInfo->CurClus_R = ((r_buffer_t *)pos)->r_e_clu;
 			int_secNum = once_secNum = (t_rSize - r_off)/PER_SECSIZE;
 			if((t_rSize - r_off)%PER_SECSIZE) once_secNum++;
             usr_read(buffer+r_off,START_SECTOR_OF_FILE(chain_low),int_secNum);
@@ -1337,8 +1346,8 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
             break;/* 读簇缓冲链节点遍历完毕，跳出 */
         }
         /* 读连续簇链 */
-        chain_low = ((w_buffer_t *)pos)->w_s_clu;
-		chain_high = ((w_buffer_t *)pos)->w_e_clu;
+        chain_low = ((r_buffer_t *)pos)->r_s_clu;
+		chain_high = ((r_buffer_t *)pos)->r_e_clu;
         once_secNum = (chain_high-chain_low+1)*g_dbr[0].secPerClus;
         usr_read(buffer+r_off,START_SECTOR_OF_FILE(chain_low),once_secNum);
         r_off += once_secNum * PER_SECSIZE;/* 更新偏移量 */
