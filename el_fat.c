@@ -1322,14 +1322,16 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
     {
         if(list_is_last(pos,&fileInfo->RDCluChainList))
         {
-            fileInfo->CurClus_R = ((w_buffer_t *)pos)->w_s_clu;
+            chain_low = ((w_buffer_t *)pos)->w_s_clu;
+            chain_high = ((w_buffer_t *)pos)->w_e_clu;
+            fileInfo->CurClus_R = ((w_buffer_t *)pos)->w_e_clu;
 			int_secNum = once_secNum = (t_rSize - r_off)/PER_SECSIZE;
 			if((t_rSize - r_off)%PER_SECSIZE) once_secNum++;
-            usr_read(buffer+r_off,START_SECTOR_OF_FILE(fileInfo->CurClus_R),int_secNum);
+            usr_read(buffer+r_off,START_SECTOR_OF_FILE(chain_low),int_secNum);
 			r_off = r_off + int_secNum * PER_SECSIZE;
 			powder_len = t_rSize - r_off;//最后不足一扇区的字节
 			if(powder_len){
-				usr_read(buffer0,START_SECTOR_OF_FILE(fileInfo->CurClus_R),1);
+				usr_read(buffer0,START_SECTOR_OF_FILE(chain_low)+int_secNum,1);
 			    YC_MemCpy(buffer+r_off,buffer0,powder_len);
             }
             break;/* 读簇缓冲链节点遍历完毕，跳出 */
