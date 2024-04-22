@@ -1301,7 +1301,7 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
             t_rCluNum += 1;
         }
         if(0 > YC_FAT_CreatReadCluChain(fileInfo,t_rCluNum))
-            return -1;
+            return 0;
         int_secNum = once_secNum = cur_leftsize/PER_SECSIZE;
         powder_len = cur_leftsize%PER_SECSIZE;
         if(powder_len) once_secNum++;
@@ -1427,19 +1427,20 @@ refresh_para_and_exit:
     }
     fileInfo->left_sz -= t_rSize;
 #endif
+	return t_rSize;
 }
 
 /* 读文件 */
-int YC_FAT_Read(FILE1* fileInfo,unsigned char * d_buf,unsigned int len)
+unsigned int YC_FAT_Read(FILE1* fileInfo,unsigned char * d_buf,unsigned int len)
 {
-    int ret;unsigned int off;
+    unsigned int ret;unsigned int off;
     if((FILE_OPEN != fileInfo->file_state) || (!fileInfo->fl_sz)) 
         return -1;
     if(1){
         off = fileInfo->fl_sz - fileInfo->left_sz;
 	    ret = YC_ReadDataNoCheck(fileInfo,off,len,d_buf);//追加数据
     }
-	return (ret < 0)?ret:0;
+	return ret;
 }
 
 /* 小写转大写 */
