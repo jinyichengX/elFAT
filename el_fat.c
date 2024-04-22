@@ -1323,9 +1323,8 @@ static J_UINT32 YC_ReadDataNoCheck(FILE1* fileInfo,unsigned int off,unsigned int
         if(list_is_last(pos,&fileInfo->RDCluChainList))
         {
             fileInfo->CurClus_R = ((w_buffer_t *)pos)->w_s_clu;
-			once_secNum = (t_rSize - r_off)/PER_SECSIZE;
-			if((t_rSize - r_off)%PER_SECSIZE)
-				int_secNum = once_secNum++;
+			int_secNum = once_secNum = (t_rSize - r_off)/PER_SECSIZE;
+			if((t_rSize - r_off)%PER_SECSIZE) once_secNum++;
             usr_read(buffer+r_off,START_SECTOR_OF_FILE(fileInfo->CurClus_R),int_secNum);
 			r_off = r_off + int_secNum * PER_SECSIZE;
 			powder_len = t_rSize - r_off;//最后不足一扇区的字节
