@@ -3412,15 +3412,16 @@ int YC_FAT_Unmount(unsigned char *drvn)
 	}
 	return 0;
 }
-#if YC_FAT_ENCODE
 
-// 定义一个枚举
+#if YC_FAT_ENCODE/* 以下是关于字符编码的一些处理 */
+
+/* 字符集枚举 */
 enum CharacterEncoding  {
     ASCII,
     UTF_8,
     GBK
 };
-/* 以下是关于字符编码的一些处理 */
+
 typedef enum CHARA_ENCODING_SET 
 {
     E_UTF8 = 0,
